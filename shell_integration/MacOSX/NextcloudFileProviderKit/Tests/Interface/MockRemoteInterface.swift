@@ -607,6 +607,8 @@ public class MockRemoteInterface: RemoteInterface, @unchecked Sendable {
     public var pagination: Bool
     public var expectedEnumerationPaginationTokens: [String: String] = [:]
     public var forceNextPageOnLastContentPage: Bool = false
+    /// When `true`, pages requested with a token answer without `X-NC-Paginate-Token` and keep accepting that token, like servers that serve follow-up pages from their cache.
+    public var omitsTokenOnFollowUpPages = false
 
     /// When set, stop sending pagination headers once this many pages have been served, although children the
     /// server counted in its own total remain unsent. Models a server which truncates a listing: the client sees
@@ -1327,15 +1329,17 @@ public class MockRemoteInterface: RemoteInterface, @unchecked Sendable {
             )
         }
 
-        func generateResponse(itemCount: Int, finalPage: Bool) -> AFDataResponse<Data>? {
+        func generateResponse(itemCount: Int, finalPage: Bool, paginationHeaders: Bool = true) -> AFDataResponse<Data>? {
             var responseHeaders: [String: String] = [:]
-            if pagination, options.paginate {
+            if pagination, options.paginate, paginationHeaders {
                 responseHeaders["X-NC-PAGINATE"] = "true"
                 if options.paginateToken == nil {
                     responseHeaders["X-NC-PAGINATE-TOTAL"] = String(itemCount)
                 }
                 if finalPage {
                     expectedEnumerationPaginationTokens.removeValue(forKey: account.ncKitAccount)
+                } else if omitsTokenOnFollowUpPages, options.paginateToken != nil {
+                    // The token of the first page stays valid.
                 } else {
                     let token = UUID().uuidString
                     responseHeaders["X-NC-PAGINATE-TOKEN"] = token
@@ -1380,7 +1384,7 @@ public class MockRemoteInterface: RemoteInterface, @unchecked Sendable {
             let itemsPage = Array(files[firstItem ... lastItem])
             let pageIndex = itemCount > 0 && itemCount != .max ? firstItem / itemCount : 0
             let truncated = paginationPageLimit.map { pageIndex + 1 >= $0 } ?? false
-            let responseData = generateResponse(itemCount: files.count, finalPage: reachedEnd || truncated)
+            let responseData = generateResponse(itemCount: files.count, finalPage: reachedEnd || truncated, paginationHeaders: !truncated)
             return (account.ncKitAccount, itemsPage, responseData, .success)
         }
 

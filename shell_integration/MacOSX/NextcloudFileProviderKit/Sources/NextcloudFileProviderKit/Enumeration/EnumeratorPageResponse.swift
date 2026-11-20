@@ -13,7 +13,8 @@ struct EnumeratorPageResponse: Codable {
     /// The directory's state, etag and permissions, as its first page reported it. Carried through the pages, so the last one records the directory as reconciled at the state its pages came from, not at whatever another listing stored meanwhile.
     var remoteState: String?
 
-    init?(nkResponseData: AFDataResponse<Data>?, index: Int, log _: any FileProviderLogging) {
+    /// `fallbackToken`: the server answers follow-up pages from its cache without re-sending the token header.
+    init?(nkResponseData: AFDataResponse<Data>?, index: Int, fallbackToken: String? = nil, log _: any FileProviderLogging) {
         guard let headers = nkResponseData?.response?.allHeaderFields as? [String: String] else {
             return nil
         }
@@ -21,7 +22,7 @@ struct EnumeratorPageResponse: Codable {
         let normalisedHeaders =
             Dictionary(uniqueKeysWithValues: headers.map { ($0.key.lowercased(), $0.value) })
         guard Bool(normalisedHeaders["x-nc-paginate"]?.lowercased() ?? "false") == true,
-              let responsePaginateToken = normalisedHeaders["x-nc-paginate-token"]
+              let responsePaginateToken = normalisedHeaders["x-nc-paginate-token"] ?? fallbackToken
         else {
             return nil
         }

@@ -143,6 +143,8 @@ extension Enumerator {
             }
 
             let serverItemTotal = nextPage?.total ?? cursor.total
+            // Cached follow-up pages omit X-NC-Paginate-Total; keep it so the stop check below still fires.
+            nextPage?.total = serverItemTotal
 
             // The target itself comes back on the first page only, so that page holds one child fewer than it holds entries.
             let entriesReturned = items.count + (cursor.index == 0 ? 1 : 0)
