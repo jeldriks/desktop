@@ -15,6 +15,8 @@ enum ScanDescentDecision: Equatable {
     case unchanged
     /// The directory has to be listed.
     case descend
+    /// The directory is on or above an external storage and unchanged as listed: a request for the directory alone lets the server check it for changes made behind its back, and only a change is listed.
+    case probe
 
     ///
     /// - Parameters:
@@ -30,9 +32,10 @@ enum ScanDescentDecision: Equatable {
             return
         }
 
-        // The server notices changes made behind its back on an external storage only when the directory is read, so one is listed on every pass, with everything above and below it.
-        guard child.mountType != FilesDatabaseManager.externalMountType, !holdsExternalStorage else {
-            self = .descend
+        // The server notices changes made behind its back on an external storage only when the directory itself is read. The server checks the read directory, not its children, so a request for the directory alone detects what a listing would.
+        guard !FilesDatabaseManager.externalMountTypes.contains(child.mountType), !holdsExternalStorage else {
+            let reconciledAsListed = child.status == Status.normal.rawValue && reconciledState == FilesDatabaseManager.scanRemoteState(of: child)
+            self = reconciledAsListed ? .probe : .descend
             return
         }
 

@@ -3,6 +3,7 @@
 
 @preconcurrency import FileProvider
 import Foundation
+import NextcloudKit
 
 /// How many reads of one kind run at a time, so a sweep over many directories does not open one connection per directory.
 public let workingSetScanConcurrency = 6
@@ -116,9 +117,10 @@ extension Enumerator {
     /// listing reports it (the server rewrites a mount point's permissions there), written only after
     /// the whole pass, and only for directories whose descended children all succeeded. A failed
     /// listing forgets the state of the directory and its ancestors, so the next pass descends there
-    /// again from the root. Directories on external storages are listed on every pass, with
-    /// everything above and below them, because the server notices changes made behind its back only
-    /// when the directory is read. See ``ScanDescentDecision``.
+    /// again from the root. Directories on external storages, and everything above and below them, are
+    /// checked on every pass, because the server notices changes made behind its back only when the
+    /// directory is read: a request for the directory alone, listed only when its etag changed. See
+    /// ``ScanDescentDecision`` and `probeDirectory`.
     ///
     /// A pass starts no further sibling after its budget is spent (``WorkingSetScanLimits``): the
     /// system issues no folder enumeration while a change enumeration is outstanding, so a long pass
@@ -223,7 +225,7 @@ extension Enumerator {
 
         logger.info(
             "Working-set scan finished.",
-            [.name: "\(state.listedCount) listed, \(state.skippedCount) skipped, \(state.failedCount) failed\(state.stoppedAtDeadline ? ", stopped at the listing budget" : "")"]
+            [.name: "\(state.listedCount) listed, \(state.probedCount) checked, \(state.skippedCount) skipped, \(state.failedCount) failed\(state.stoppedAtDeadline ? ", stopped at the listing budget" : "")"]
         )
 
         return (updated: discoveredUpdates, deleted: deletions, storeUnreadable: storeUnreadable, failedListingCount: state.failedCount, stoppedAtDeadline: state.stoppedAtDeadline)
@@ -291,29 +293,12 @@ extension Enumerator {
         let isRoot = ocId == NSFileProviderItemIdentifier.rootContainer.rawValue
 
         if readResult.error?.errorCode == 404, !isRoot {
-            // The directory is gone; its subtree is expanded once the pass is over and moves are known.
-            logger.debug("Directory is gone from the server; its subtree is reported deleted.", [.url: remotePath])
-            if var gone = metadata {
-                gone.deleted = true
-                gone.syncTime = Date()
-                state.missing.append(gone)
-                state.notFoundOcIds.insert(ocId)
-                state.tombstoningChains.formUnion(ancestorOcIds)
-            }
+            recordNotFound(at: remotePath, ocId: ocId, metadata: metadata, ancestorOcIds: ancestorOcIds, state: &state)
             return true
         }
 
         if let readError = readResult.error, readError != .success {
-            // The rest of the working set is still scanned. This directory and its ancestors forget
-            // their reconciled state, so the next pass descends here again whatever else changed.
-            // See nextcloud/desktop#10442.
-            logger.error(
-                "Directory listing failed; the directory and its ancestors are scanned again on the next pass.",
-                [.error: readError, .url: remotePath]
-            )
-            state.failedCount += 1
-            state.forgotten.formUnion(ancestorOcIds)
-            state.forgotten.insert(ocId)
+            recordFailedRead(readError, at: remotePath, ocId: ocId, ancestorOcIds: ancestorOcIds, state: &state)
             return false
         }
 
@@ -330,7 +315,7 @@ extension Enumerator {
         // a pin and a download are recorded, and reports the rows as the store holds them after the write.
         guard let rows = readResult.metadatas,
               case let listedRows = Enumerator.storedRows(for: rows, dbManager: dbManager),
-              let listedTarget = listedRows.first
+              listedRows.first != nil
         else {
             return true
         }
@@ -339,10 +324,120 @@ extension Enumerator {
         // older path answers later in the pass.
         state.survivingOcIds.formUnion(listedRows.map(\.ocId))
 
-        var allDescentsSucceeded = true
-        var toDescend: [SendableItemMetadata] = []
+        return await walk(
+            below: ocId,
+            children: Array(listedRows.dropFirst()),
+            ancestorOcIds: ancestorOcIds,
+            remoteStateAsListed: remoteStateAsListed,
+            readLimiter: readLimiter,
+            state: &state
+        )
+    }
 
-        for child in listedRows.dropFirst() where child.directory {
+    ///
+    /// Check a directory on or above an external storage with a request for the directory alone, which lets the
+    /// server notice changes made behind its back, and list it only when that changed its etag.
+    ///
+    /// The server checks the directory a request reads, not its children, so the request detects what a listing
+    /// would. A change deeper down reaches this directory's etag only once that deeper directory is read itself,
+    /// so an unchanged directory still has the tracked directories below it checked, taken from the store.
+    ///
+    /// - Parameter child: The directory as its parent's listing reports it, unchanged since the last pass.
+    /// - Returns: Whether this directory and everything checked below it succeeded.
+    ///
+    private func probeDirectory(
+        _ child: SendableItemMetadata,
+        ancestorOcIds: [String],
+        startsChainBelowParent: Bool,
+        readLimiter: ScanReadLimiter,
+        state: inout WorkingSetScanState
+    ) async -> Bool {
+        let remotePath = child.remotePath()
+
+        guard startsChainBelowParent || ContinuousClock.now < state.deadline else {
+            logger.debug("Not starting another listing in this pass; the listing budget is spent.", [.url: remotePath])
+            state.stoppedAtDeadline = true
+            return false
+        }
+
+        logger.debug("Checking a directory on an external storage for working-set changes.", [.url: remotePath])
+        state.probedCount += 1
+
+        await readLimiter.acquire()
+        let readResult = await Enumerator.readServerUrl(
+            remotePath,
+            account: account,
+            remoteInterface: remoteInterface,
+            dbManager: dbManager,
+            depth: .target,
+            recordVisit: false,
+            log: logger.log
+        )
+        await readLimiter.release()
+
+        if readResult.error?.errorCode == 404 {
+            recordNotFound(at: remotePath, ocId: child.ocId, metadata: child, ancestorOcIds: ancestorOcIds, state: &state)
+            return true
+        }
+
+        if let readError = readResult.error, readError != .success {
+            recordFailedRead(readError, at: remotePath, ocId: child.ocId, ancestorOcIds: ancestorOcIds, state: &state)
+            return false
+        }
+
+        let remoteStateAsListed = FilesDatabaseManager.scanRemoteState(of: child)
+        state.survivingOcIds.insert(child.ocId)
+
+        // Only the etag is compared: the server rewrites a mount point's permissions in its parent's listing, so the directory's own permissions never match the listed ones.
+        if let probed = readResult.metadatas?.first, probed.etag != child.etag {
+            // The parent's next listing reports the new etag with the permissions it always reports.
+            var asListedNext = child
+            asListedNext.etag = probed.etag
+            return await listDirectory(
+                at: remotePath,
+                ocId: child.ocId,
+                metadata: child,
+                remoteStateAsListed: FilesDatabaseManager.scanRemoteState(of: asListedNext),
+                ancestorOcIds: ancestorOcIds,
+                startsChainBelowParent: true,
+                readLimiter: readLimiter,
+                state: &state
+            )
+        }
+
+        guard let subdirectories = dbManager.liveChildDirectories(below: remotePath) else {
+            recordFailedRead(.invalidData, at: remotePath, ocId: child.ocId, ancestorOcIds: ancestorOcIds, state: &state)
+            return false
+        }
+
+        return await walk(
+            below: child.ocId,
+            children: subdirectories,
+            ancestorOcIds: ancestorOcIds,
+            remoteStateAsListed: remoteStateAsListed,
+            readLimiter: readLimiter,
+            state: &state
+        )
+    }
+
+    ///
+    /// Decide for the child directories of one directory whether to list, check or skip them, walk the ones
+    /// to visit, and remember the directory's state when everything below it succeeded.
+    ///
+    /// - Returns: Whether every directory walked below succeeded.
+    ///
+    private func walk(
+        below ocId: String,
+        children: [SendableItemMetadata],
+        ancestorOcIds: [String],
+        remoteStateAsListed: String?,
+        readLimiter: ScanReadLimiter,
+        state: inout WorkingSetScanState
+    ) async -> Bool {
+        var allDescentsSucceeded = true
+        var toVisit: [(directory: SendableItemMetadata, probe: Bool)] = []
+
+        for child in children where child.directory {
             guard !isLockFileName(child.fileName), state.listedOcIds.insert(child.ocId).inserted else {
                 continue
             }
@@ -364,13 +459,15 @@ extension Enumerator {
                     state.skippedCount += 1
                     continue
                 case .descend:
-                    toDescend.append(child)
+                    toVisit.append((child, false))
+                case .probe:
+                    toVisit.append((child, true))
             }
         }
 
-        if !toDescend.isEmpty {
+        if !toVisit.isEmpty {
             let descents = await descend(
-                into: toDescend, below: ocId, ancestorOcIds: ancestorOcIds, readLimiter: readLimiter, state: &state
+                into: toVisit, below: ocId, ancestorOcIds: ancestorOcIds, readLimiter: readLimiter, state: &state
             )
             allDescentsSucceeded = descents
         }
@@ -380,6 +477,37 @@ extension Enumerator {
         }
 
         return allDescentsSucceeded
+    }
+
+    /// Record a directory the server answered 404 for; its subtree is expanded once the pass is over and moves are known.
+    private func recordNotFound(
+        at remotePath: String, ocId: String, metadata: SendableItemMetadata?, ancestorOcIds: [String], state: inout WorkingSetScanState
+    ) {
+        logger.debug("Directory is gone from the server; its subtree is reported deleted.", [.url: remotePath])
+        if var gone = metadata {
+            gone.deleted = true
+            gone.syncTime = Date()
+            state.missing.append(gone)
+            state.notFoundOcIds.insert(ocId)
+            state.tombstoningChains.formUnion(ancestorOcIds)
+        }
+    }
+
+    ///
+    /// Record a directory which could not be read. The rest of the working set is still scanned. This directory
+    /// and its ancestors forget their reconciled state, so the next pass descends here again whatever else changed.
+    /// See nextcloud/desktop#10442.
+    ///
+    private func recordFailedRead(
+        _ readError: NKError, at remotePath: String, ocId: String, ancestorOcIds: [String], state: inout WorkingSetScanState
+    ) {
+        logger.error(
+            "Directory listing failed; the directory and its ancestors are scanned again on the next pass.",
+            [.error: readError, .url: remotePath]
+        )
+        state.failedCount += 1
+        state.forgotten.formUnion(ancestorOcIds)
+        state.forgotten.insert(ocId)
     }
 
     ///
@@ -399,7 +527,7 @@ extension Enumerator {
     /// - Returns: Whether every subtree was walked to its end.
     ///
     private func descend(
-        into children: [SendableItemMetadata],
+        into children: [(directory: SendableItemMetadata, probe: Bool)],
         below ocId: String,
         ancestorOcIds: [String],
         readLimiter: ScanReadLimiter,
@@ -411,7 +539,7 @@ extension Enumerator {
         var results: [Int: (succeeded: Bool, state: WorkingSetScanState)] = [:]
 
         await withTaskGroup(of: (offset: Int, succeeded: Bool, state: WorkingSetScanState).self) { group in
-            for (offset, child) in children.enumerated() {
+            for (offset, (child, probe)) in children.enumerated() {
                 if started >= scanLimits.concurrentListings, let finished = await group.next() {
                     results[finished.offset] = (finished.succeeded, finished.state)
                 }
@@ -419,16 +547,26 @@ extension Enumerator {
                 started += 1
                 group.addTask { [self] in
                     var subtree = seed
-                    let succeeded = await listDirectory(
-                        at: child.remotePath(),
-                        ocId: child.ocId,
-                        metadata: child,
-                        remoteStateAsListed: FilesDatabaseManager.scanRemoteState(of: child),
-                        ancestorOcIds: ancestors,
-                        startsChainBelowParent: offset == 0,
-                        readLimiter: readLimiter,
-                        state: &subtree
-                    )
+                    let succeeded = if probe {
+                        await probeDirectory(
+                            child,
+                            ancestorOcIds: ancestors,
+                            startsChainBelowParent: offset == 0,
+                            readLimiter: readLimiter,
+                            state: &subtree
+                        )
+                    } else {
+                        await listDirectory(
+                            at: child.remotePath(),
+                            ocId: child.ocId,
+                            metadata: child,
+                            remoteStateAsListed: FilesDatabaseManager.scanRemoteState(of: child),
+                            ancestorOcIds: ancestors,
+                            startsChainBelowParent: offset == 0,
+                            readLimiter: readLimiter,
+                            state: &subtree
+                        )
+                    }
                     return (offset, succeeded, subtree)
                 }
             }

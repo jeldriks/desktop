@@ -45,6 +45,7 @@ struct WorkingSetScanState {
     var forgotten: Set<String> = []
 
     var listedCount = 0
+    var probedCount = 0
     var skippedCount = 0
     var failedCount = 0
 
@@ -74,6 +75,7 @@ struct WorkingSetScanState {
         reconciled.merge(subtree.reconciled) { _, fromSubtree in fromSubtree }
         forgotten.formUnion(subtree.forgotten)
         listedCount += subtree.listedCount
+        probedCount += subtree.probedCount
         skippedCount += subtree.skippedCount
         failedCount += subtree.failedCount
     }

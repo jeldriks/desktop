@@ -77,7 +77,10 @@ struct WorkingSetScanTests {
 
     private struct Pass {
         let observer: MockChangeObserver
+        /// The directories the pass listed with their children.
         let paths: [String]
+        /// The items the pass read alone.
+        let probes: [String]
         var reported: Set<String> {
             Set(observer.changedItems.map(\.itemIdentifier.rawValue))
         }
@@ -121,7 +124,8 @@ struct WorkingSetScanTests {
         )
         let observer = MockChangeObserver(enumerator: enumerator)
         try await observer.enumerateChanges(from: anchor ?? self.anchor)
-        return Pass(observer: observer, paths: recorder.paths.map { $0.replacingOccurrences(of: account.davFilesUrl, with: "") })
+        let relative = { (paths: [String]) in paths.map { $0.replacingOccurrences(of: account.davFilesUrl, with: "") } }
+        return Pass(observer: observer, paths: relative(recorder.listings), probes: relative(recorder.probes))
     }
 
     /// A pass which records the reconciled state of every directory, so the next pass is a warm one.
@@ -467,7 +471,7 @@ struct WorkingSetScanTests {
 
     // MARK: - Policies
 
-    @Test func anExternalStorageDirectoryIsListedOnEveryPass() async throws {
+    @Test func anExternalStorageDirectoryIsCheckedOnEveryPass() async throws {
         let mount = makeFolder("mount", in: rootItem)
         let inside = makeFolder("inside", in: mount)
         let other = makeFolder("other", in: rootItem)
@@ -481,10 +485,11 @@ struct WorkingSetScanTests {
 
         let idle = try await pass(from: warmAnchor)
 
-        #expect(idle.paths == ["", "/mount", "/mount/inside"], "The server notices changes made behind its back only when the directory is read.")
+        #expect(idle.paths == [""], "Nothing changed, so nothing on the external storage is listed.")
+        #expect(idle.probes == ["/mount", "/mount/inside"], "The server notices changes made behind its back only when the directory is read, so each one is read alone.")
     }
 
-    @Test func anExternalStorageBelowAnUnchangedDirectoryIsListedOnEveryPass() async throws {
+    @Test func anExternalStorageBelowAnUnchangedDirectoryIsCheckedOnEveryPass() async throws {
         let parent = makeFolder("parent", in: rootItem)
         let mount = makeFolder("mount", in: parent)
         let inside = makeFolder("inside", in: mount)
@@ -500,7 +505,131 @@ struct WorkingSetScanTests {
 
         let idle = try await pass(from: warmAnchor)
 
-        #expect(idle.paths == ["", "/parent", "/parent/mount", "/parent/mount/inside"], "The walk has to pass through the unchanged parent to reach the mount.")
+        #expect(idle.paths == [""])
+        #expect(idle.probes == ["/parent", "/parent/mount", "/parent/mount/inside"], "The walk passes through the unchanged parent to reach the mount, taking the directories below from the store.")
+    }
+
+    @Test func aChangeBehindTheServersBackIsListedWhereItHappened() async throws {
+        let mount = makeFolder("mount", in: rootItem)
+        let inside = makeFolder("inside", in: mount)
+        mount.mountType = FilesDatabaseManager.externalMountType
+        inside.mountType = FilesDatabaseManager.externalMountType
+        seed(rootItem, visited: true)
+        seed(mount, visited: true)
+        seed(inside, visited: true)
+        let warmAnchor = try await warmUp()
+
+        // Written to the backend directly: only a read of `inside` lets the server notice, so no ancestor's etag moved.
+        let added = makeFile("added", in: inside)
+        added.mountType = FilesDatabaseManager.externalMountType
+        inside.versionIdentifier = "inside-v2"
+        let changed = try await pass(from: warmAnchor)
+
+        #expect(changed.probes == ["/mount", "/mount/inside"])
+        #expect(changed.paths == ["", "/mount/inside"], "Only the directory whose own read showed the change is listed.")
+        #expect(changed.reported.contains("added"))
+
+        let idle = try await pass(from: #require(changed.anchor))
+        #expect(idle.paths == [""], "The directory is reconciled at the etag the server reports for it from now on.")
+    }
+
+    @Test func aDirectoryGoneFromAnExternalStorageIsReportedDeleted() async throws {
+        let mount = makeFolder("mount", in: rootItem)
+        let inside = makeFolder("inside", in: mount)
+        let file = makeFile("file", in: inside)
+        mount.mountType = FilesDatabaseManager.externalMountType
+        inside.mountType = FilesDatabaseManager.externalMountType
+        file.mountType = FilesDatabaseManager.externalMountType
+        seed(rootItem, visited: true)
+        seed(mount, visited: true)
+        seed(inside, visited: true)
+        seed(file, downloaded: true)
+        let warmAnchor = try await warmUp()
+
+        mount.children.removeAll { $0 === inside }
+        let gone = try await pass(from: warmAnchor)
+
+        #expect(gone.probes == ["/mount", "/mount/inside"])
+        #expect(gone.deleted.isSuperset(of: ["inside", "file"]), "The read of the directory alone answers 404, and its subtree is reported deleted.")
+    }
+
+    @Test func aStorageWithSessionCredentialsCountsAsExternal() async throws {
+        let mount = makeFolder("mount", in: rootItem)
+        mount.mountType = "external-session"
+        seed(rootItem, visited: true)
+        seed(mount, visited: true)
+        let warmAnchor = try await warmUp()
+
+        let idle = try await pass(from: warmAnchor)
+
+        #expect(idle.probes == ["/mount"], "The server reports `external-session` for a storage with log-in credentials saved in the session.")
+    }
+
+    @Test func aNeverReconciledExternalDirectoryIsListed() async throws {
+        let mount = makeFolder("mount", in: rootItem)
+        mount.mountType = FilesDatabaseManager.externalMountType
+        seed(rootItem, visited: true)
+        seed(mount, visited: true)
+
+        let cold = try await pass()
+
+        #expect(cold.paths == ["", "/mount"], "Only the scan's own state says a subtree was checked, so the first pass lists it.")
+        #expect(cold.probes.isEmpty)
+    }
+
+    @Test func aFailedCheckForgetsTheChainAndIsListedAgainNextPass() async throws {
+        let mount = makeFolder("mount", in: rootItem)
+        let inside = makeFolder("inside", in: mount)
+        mount.mountType = FilesDatabaseManager.externalMountType
+        inside.mountType = FilesDatabaseManager.externalMountType
+        seed(rootItem, visited: true)
+        seed(mount, visited: true)
+        seed(inside, visited: true)
+        let warmAnchor = try await warmUp()
+        try await waitForTheSecondAfter(warmAnchor)
+
+        remoteInterface.enumerateErrorBySuffix = ["/mount/inside": NKError(statusCode: 502, fallbackDescription: "Bad Gateway")]
+        let failing = try await pass(from: warmAnchor)
+
+        #expect(failing.observer.error == nil)
+        #expect(failing.probes == ["/mount", "/mount/inside"])
+        for ocId in ["mount", "inside"] {
+            #expect(manager.scannedRemoteStateForTesting(ocId: ocId) == nil, "\(ocId) is on the chain of the failed check and is forgotten.")
+        }
+
+        remoteInterface.enumerateErrorBySuffix = [:]
+        let advanced = try #require(failing.anchor)
+        try await waitForTheSecondAfter(advanced)
+        let retried = try await pass(from: advanced)
+
+        #expect(retried.paths == ["", "/mount", "/mount/inside"], "The chain is listed again although nothing changed meanwhile.")
+        #expect(retried.probes.isEmpty)
+    }
+
+    @Test func aSlowExternalStorageNoLongerHoldsBackDeletionsElsewhere() async throws {
+        let mount = makeFolder("mount", in: rootItem)
+        let inside = makeFolder("inside", in: mount)
+        let other = makeFolder("other", in: rootItem)
+        let gone = makeFile("gone", in: other)
+        mount.mountType = FilesDatabaseManager.externalMountType
+        inside.mountType = FilesDatabaseManager.externalMountType
+        seed(rootItem, visited: true)
+        seed(mount, visited: true)
+        seed(inside, visited: true)
+        seed(other, visited: true)
+        seed(gone, downloaded: true)
+        let warmAnchor = try await warmUp()
+
+        // Listing the mount outlasts the budget on every pass; reading a directory alone answers at once.
+        remoteInterface.enumerateLatencyBySuffix = ["/mount": .seconds(2), "/mount/inside": .seconds(2)]
+        other.children.removeAll { $0 === gone }
+        other.bumpVersion()
+        let limits = WorkingSetScanLimits(listingBudget: .seconds(1), resumeDelay: .zero, concurrentListings: 1)
+        let changed = try await pass(from: warmAnchor, limits: limits)
+
+        #expect(changed.probes == ["/mount", "/mount/inside"])
+        #expect(changed.paths == ["", "/other"], "The unchanged mount is not listed, so the pass reaches the other directory within its budget.")
+        #expect(changed.deleted.contains("gone"), "A complete pass reports the deletion.")
     }
 
     @Test func aMountPointIsReconciledByTheStateItsParentLists() async throws {

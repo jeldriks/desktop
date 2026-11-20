@@ -307,7 +307,7 @@ extension Enumerator {
                 reconciledState: reconciledStates[child.ocId]
             )
 
-            if decision == .descend {
+            if decision == .descend || decision == .probe {
                 logger.debug("Leaving a directory with a child the working-set scan has to list to the scan.", [.item: directory.ocId, .url: childPath])
                 return
             }

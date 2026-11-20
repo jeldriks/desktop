@@ -690,7 +690,7 @@ public class MockRemoteInterface: RemoteInterface, @unchecked Sendable {
     /// which one folder's PROPFIND fails (e.g. a large container timing out) while the rest succeed.
     public var enumerateErrorBySuffix: [String: NKError] = [:]
 
-    /// Test hook: how long a directory read of a path with the given suffix takes before it answers, as a slow server would.
+    /// Test hook: how long a listing of a directory with a path of the given suffix takes before it answers, as a slow server would. A read of the item alone answers at once, as it does for a large directory.
     public var enumerateLatencyBySuffix: [String: Duration] = [:]
 
     public init(
@@ -1302,7 +1302,7 @@ public class MockRemoteInterface: RemoteInterface, @unchecked Sendable {
 
         print("Enumerating \(remotePath)")
 
-        if let latency = enumerateLatencyBySuffix.first(where: { remotePath.hasSuffix($0.key) })?.value {
+        if depth != .target, let latency = enumerateLatencyBySuffix.first(where: { remotePath.hasSuffix($0.key) })?.value {
             try? await Task.sleep(for: latency)
         }
 

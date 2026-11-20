@@ -13,6 +13,9 @@ extension FilesDatabaseManager {
     /// The mount type the server reports for every item on an external storage.
     static let externalMountType = "external"
 
+    /// Every mount type of an external storage; one with "Log-in credentials, save in session" reports `external-session`.
+    static let externalMountTypes: Set<String> = [externalMountType, "external-session"]
+
     /// The remote state the working-set scan compares a directory against, built from what its parent's listing reports.
     static func scanRemoteState(of metadata: SendableItemMetadata) -> String {
         "\(metadata.etag)|\(metadata.permissions)"
@@ -121,11 +124,25 @@ extension FilesDatabaseManager {
             try ItemMetadataRecord
                 .filter(
                     ItemMetadataRecord.hasServerUrl(equalTo: remotePath, includingDescendants: true)
-                        && ItemMetadataRecord.Columns.mountType == Self.externalMountType
+                        && Self.externalMountTypes.contains(ItemMetadataRecord.Columns.mountType)
                         && ItemMetadataRecord.Columns.deleted == false
                 )
                 .limit(1)
                 .fetchCount(db) > 0
+        }
+    }
+
+    /// The live directories stored directly below the directory at `remotePath`, or `nil` when the read fails.
+    func liveChildDirectories(below remotePath: String) -> [SendableItemMetadata]? {
+        read("Could not read the directories below a directory.", [.url: remotePath]) { db in
+            try ItemMetadataRecord
+                .filter(
+                    ItemMetadataRecord.hasServerUrl(equalTo: remotePath, includingDescendants: false)
+                        && ItemMetadataRecord.Columns.directory == true
+                        && ItemMetadataRecord.Columns.deleted == false
+                )
+                .fetchRecords(db, logger: logger)
+                .map(\.metadata)
         }
     }
 
